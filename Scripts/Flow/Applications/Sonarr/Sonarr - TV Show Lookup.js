@@ -30,7 +30,7 @@ function Script(URL, ApiKey) {
 
     Logger.ILog(`Sonarr URL: ${URL}`);
 
-    // Try the file name first, then fall back to the folder name (e.g. a season pack folder)
+    // Try the file name first, then the folder name
     let series = lookupSeries(fileNameNoExt, sonarr, false);
     if (!series && folderName && folderName.toLowerCase() !== (fileNameNoExt || '').toLowerCase()) {
         Logger.ILog('No match using the file name, trying the folder name');
@@ -58,11 +58,8 @@ function lookupSeries(searchPattern, sonarr, isFolder) {
     Logger.ILog(`Lookup TV Show: ${searchPattern}`);
 
     try {
-        // Parse the name once with Sonarr's own parser. The parsed title/year is used to
-        // verify candidates found in the queue or history. Records Sonarr created for its own
-        // grabs are trusted (year check only), because release names are often transliterated
-        // or translated and won't match the library title. Imports without a downloadId
-        // (e.g. done by FileFlows itself) can be wrong, so those also need a title match.
+        // The parsed title/year verifies candidates. Sonarr's own grabs only need the year;
+        // imports without a downloadId also need the title.
         const parsed = parseSeries(searchPattern, sonarr, true);
         const expected = getExpectedInfo(parsed);
         if (expected) {
@@ -71,6 +68,12 @@ function lookupSeries(searchPattern, sonarr, isFolder) {
             Logger.WLog('Sonarr could not parse a title from the name, candidates will not be verified');
         }
         const isValid = (series, trusted) => validateSeries(series, expected, trusted);
+
+        // An unparseable folder name only uses the path lookup
+        if (isFolder && !expected) {
+            Logger.WLog('The folder name is not a release name, only searching by path');
+            return searchSeriesByPath(searchPattern, sonarr, isValid);
+        }
 
         return searchSeriesByName(parsed, expected, sonarr) ||
                (isFolder && searchSeriesByPath(searchPattern, sonarr, isValid)) ||
@@ -87,9 +90,7 @@ function lookupSeries(searchPattern, sonarr, isFolder) {
 let seriesCache = null;
 
 /**
- * @description Looks up the parsed series name in the Sonarr library. Uses the series Sonarr's
- *              parser already mapped the name to; otherwise compares the parsed title with every
- *              library series' title and alternate titles (and the year, if the name has one).
+ * @description Finds the parsed series in the library: Sonarr's parse mapping, then title (and year)
  * @param {Object} parsed - Full output of the Sonarr parse endpoint
  * @param {Object|null} expected - Result of getExpectedInfo
  * @param {Object} sonarr - Sonarr API instance
@@ -215,9 +216,8 @@ function titleMatches(series, expected) {
 }
 
 /**
- * @description Narrows series.EpisodesInfo down to the episodes in the file name. Uses Sonarr's
- *              parse of the file name; if the episodes found so far don't cover it (e.g. the
- *              match came from a season pack), the series' episode list is fetched instead.
+ * @description Narrows series.EpisodesInfo to the file's episodes, using Sonarr's parse first and
+ *              the series' episode list when the known episodes don't cover the file
  * @param {Object} series - Series object, EpisodesInfo is updated in place
  * @param {string} fileNameNoExt - File name without extension
  * @param {Object} sonarr - Sonarr API instance
@@ -503,17 +503,15 @@ function searchInDownloadHistory(searchPattern, sonarr, isValid, isFolder) {
 function searchInGrabHistory(searchPattern, sonarr, isValid) {
     Logger.ILog(`Searching in Grab History`);
 
-    // Indexers often report release names with spaces instead of dots, so compare loosely
+    // Compare with punctuation collapsed (dots vs spaces)
     return searchSonarrAPI('history', searchPattern, sonarr, (item, sp) => {
         return item.sourceTitle && loose(item.sourceTitle) === loose(sp);
     }, item => isValid(item.series, true), { eventType: 1 });   // 1 == grabbed
 }
 
 /**
- * @description Generic function to search Sonarr API (queue or history) based on a search pattern.
- *              Every matching record is checked with acceptItem, so a record that Sonarr attached
- *              to the wrong series is skipped. All episodes of the first accepted series are
- *              collected (a multi-episode file or season pack has one record per episode).
+ * @description Searches the queue or history; collects the episodes of the first series whose
+ *              matching record passes acceptItem
  * @param {string} endpoint - The Sonarr API endpoint to search (queue or history)
  * @param {string} searchPattern - The search string (file or folder name)
  * @param {Object} sonarr - Sonarr API instance
@@ -561,8 +559,7 @@ function searchSonarrAPI(endpoint, searchPattern, sonarr, matchFunction, acceptI
                 lastMatched = idx === items.length - 1;
             });
 
-            // Records of one grab/import are next to each other; only read on if they may
-            // continue on the next page
+            // Read the next page only if the matching records may continue there
             const atEnd = endpoint === 'queue' || items.length < pageSize;
             if (atEnd || (seriesObj && !lastMatched)) break;
             page++;

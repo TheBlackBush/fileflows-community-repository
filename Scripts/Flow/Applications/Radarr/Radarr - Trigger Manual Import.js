@@ -36,15 +36,17 @@ function Script(URL, ApiKey, ImportPath, UseUnmappedPath, MoveMode, TimeOut) {
     Logger.ILog(`Import Mode: ${importMode}`);
 
     /*── movieId detection ──────────────────────────────────*/
+    const names = [Variables.file.Orig.FileNameNoExtension, Variables.folder?.Orig?.Name].filter(n => n);
     let movieId = toId(Variables['Radarr.movieId']) || toId(Variables.MovieInfo?.id);
+    if (movieId) movieId = checkMovieId(radarr, movieId, names[0]);
     if (!movieId) {
-        Logger.ILog('No movieId from the lookup step, trying to parse the file/folder name');
+        Logger.ILog('No usable movieId from the lookup step, trying to parse the file/folder name');
         movieId = parseMovie(Variables.file.Orig.FileNameNoExtension, radarr) ||
                   parseMovie(Variables.folder?.Orig?.Name, radarr);
     }
 
     /*─ Find the download in Radarr's queue, so the import is tied to it ─*/
-    const downloadId = Variables['Radarr.downloadId'] || (movieId ? findDownloadId(radarr, movieId) : null);
+    const downloadId = Variables['Radarr.downloadId'] || (movieId ? findDownloadId(radarr, movieId, names) : null);
 
     /*─ Execute first workflow, then fail-over if needed ─*/
     if (movieId) {
@@ -99,7 +101,7 @@ function manualImportWorkflow(radarr, path, mode, movieId, downloadId, timeout) 
     const status = waitForCommand(radarr, cmdId, timeout);
     if (status !== 1) return status;
 
-    // A completed command doesn't mean the file was imported: check the movie got a new file
+    // Verify the movie got a new file
     const after = getMovieFileId(radarr, movieId);
     if (after === null || before === null) return 1; // could not verify
     if (!after || after === before) {
@@ -157,8 +159,7 @@ function pickCandidate(candidates, path, belongs) {
     const ours = withQuality.filter(c => belongs(c) && !isSample(c));
     const real = withQuality.filter(c => !isSample(c));
 
-    // Prefer the file by name, then the only non-sample file Radarr matched to our item,
-    // then the only non-sample file
+    // By name, then the only non-sample file matched to our item, then the only non-sample file
     const cand = byName[0] ||
                  (ours.length === 1 ? ours[0] : null) ||
                  (real.length === 1 ? real[0] : null);
@@ -171,6 +172,15 @@ function pickCandidate(candidates, path, belongs) {
     }
     Logger.ILog(`Using ManualImport candidate: ${cand.path}`);
     return cand;
+}
+
+/**
+ * @description Compares release names ignoring case and punctuation (dots vs spaces)
+ * @param {string} s - Release name
+ * @returns {string} Collapsed name
+ */
+function loose(s) {
+    return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
 /**
@@ -209,21 +219,56 @@ function buildManualImportFile(src, movieId, importPath, downloadId) {
 }
 
 /**
- * @description Finds the download client id of the queue item holding this movie
+ * @description Checks the lookup movieId against Radarr's parse of the file name
+ * @param {Radarr} radarr - Radarr API instance
+ * @param {number} movieId - Movie id from the lookup step
+ * @param {string} fileNameNoExt - File name without extension
+ * @returns {number|null} The movie id to use, or null if it doesn't fit the file
+ */
+function checkMovieId(radarr, movieId, fileNameNoExt) {
+    try {
+        const parsed = radarr.fetchJson('parse', buildQueryParams({ title: fileNameNoExt }));
+        if (parsed?.movie?.id) {
+            if (parsed.movie.id !== movieId) {
+                Logger.WLog(`movieId ${movieId} from the lookup step doesn't match the file, Radarr parses it as ${parsed.movie.title} (${parsed.movie.year}), using movieId ${parsed.movie.id}`);
+            }
+            return parsed.movie.id;
+        }
+
+        const year = parsed?.parsedMovieInfo?.year;
+        const movie = radarr.fetchJson(`movie/${movieId}`, '');
+        if (year && movie?.year && Math.abs(year - movie.year) > 1) {
+            const title = parsed.parsedMovieInfo.primaryMovieTitle || (parsed.parsedMovieInfo.movieTitles || [])[0] || fileNameNoExt;
+            Logger.WLog(`movieId ${movieId} is ${movie.title} (${movie.year}), but the file is ${title} (${year}). Not importing it as that movie.`);
+            return null;
+        }
+    } catch (e) {
+        Logger.WLog(`Could not check movieId ${movieId}: ${e.message}`);
+    }
+    return movieId;
+}
+
+/**
+ * @description Finds the queue downloadId for this movie whose release name matches the file or folder
  * @param {Radarr} radarr - Radarr API instance
  * @param {number} movieId - Movie id
+ * @param {string[]} names - File name without extension and folder name
  * @returns {string|null} downloadId, or null if the download is not in the queue
  */
-function findDownloadId(radarr, movieId) {
+function findDownloadId(radarr, movieId, names) {
+    const wanted = names.map(loose);
     try {
         const json = radarr.fetchJson('queue', buildQueryParams({ page: 1, pageSize: 1000, includeUnknownMovieItems: 'false' }));
-        const items = (json?.records || []).filter(r => r.movieId === movieId && r.downloadId);
+        const forMovie = (json?.records || []).filter(r => r.movieId === movieId && r.downloadId);
+        const items = forMovie.filter(r => wanted.includes(loose(r.title)) || wanted.includes(loose(baseName(r.outputPath))));
         if (items.length === 1) {
             Logger.ILog(`Found the download in Radarr's queue: ${items[0].title} (downloadId ${items[0].downloadId})`);
             return items[0].downloadId;
         }
         if (items.length > 1) {
-            Logger.WLog(`${items.length} downloads for movie ${movieId} are in the queue, not linking the import to one`);
+            Logger.WLog(`${items.length} downloads for this file are in the queue, not linking the import to one`);
+        } else if (forMovie.length) {
+            Logger.ILog(`Queue has ${forMovie.length} download(s) for movie ${movieId}, but none is this release: ${forMovie.map(r => r.title).join(', ')}`);
         }
     } catch (e) {
         Logger.WLog(`Could not read Radarr's queue: ${e.message}`);

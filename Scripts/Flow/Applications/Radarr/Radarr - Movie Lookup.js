@@ -57,11 +57,8 @@ function lookupMovie(searchPattern, radarr, isFolder) {
     Logger.ILog(`Lookup Movie name: ${searchPattern}`);
 
     try {
-        // Parse the name once with Radarr's own parser. The parsed title/year is used to
-        // verify candidates found in the queue or history. Records Radarr created for its own
-        // grabs are trusted (year check only), because release names are often transliterated
-        // or translated and won't match the library title. Imports without a downloadId
-        // (e.g. done by FileFlows itself) can be wrong, so those also need a title match.
+        // The parsed title/year verifies candidates. Radarr's own grabs only need the year;
+        // imports without a downloadId also need the title.
         const parsed = parseMovie(searchPattern, radarr, true);
         const expected = getExpectedInfo(parsed);
         if (expected) {
@@ -70,6 +67,12 @@ function lookupMovie(searchPattern, radarr, isFolder) {
             Logger.WLog('Radarr could not parse a title from the name, candidates will not be verified');
         }
         const isValid = (movie, trusted) => validateMovie(movie, expected, trusted);
+
+        // An unparseable folder name only uses the path lookup
+        if (isFolder && !expected) {
+            Logger.WLog('The folder name is not a release name, only searching by path');
+            return searchMovieByPath(searchPattern, radarr, isValid);
+        }
 
         return searchMovieByName(parsed, expected, radarr) ||
                (isFolder && searchMovieByPath(searchPattern, radarr, isValid)) ||
@@ -86,9 +89,7 @@ function lookupMovie(searchPattern, radarr, isFolder) {
 let movieCache = null;
 
 /**
- * @description Looks up the parsed movie name in the Radarr library. Uses the movie Radarr's
- *              parser already mapped the name to; otherwise compares the parsed title with every
- *              library movie's title, original title and alternate titles, and the year.
+ * @description Finds the parsed movie in the library: Radarr's parse mapping, then title and year
  * @param {Object} parsed - Full output of the Radarr parse endpoint
  * @param {Object|null} expected - Result of getExpectedInfo
  * @param {Object} radarr - Radarr API instance
@@ -116,9 +117,22 @@ function searchMovieByName(parsed, expected, radarr) {
         }
         if (candidates.length > 1) {
             Logger.WLog(`Movie name is ambiguous: ${candidates.map(m => `${m.title} (${m.year})`).join(', ')}`);
-        } else {
-            Logger.WLog('No library movie has this name');
+            return null;
         }
+
+        // Loose fallback: same year, title starts with the parsed words, single result
+        if (expected.year) {
+            const loose = movieCache.filter(m => m.year === expected.year && wordsMatch(m, expected));
+            if (loose.length === 1) {
+                Logger.ILog(`Found Movie by similar name: ${loose[0].title} (${loose[0].year})`);
+                return loose[0];
+            }
+            if (loose.length > 1) {
+                Logger.WLog(`Similar movie names are ambiguous: ${loose.map(m => `${m.title} (${m.year})`).join(', ')}`);
+                return null;
+            }
+        }
+        Logger.WLog('No library movie has this name');
     } catch (e) {
         Logger.ELog(`Error fetching Radarr movie list: ${e.message}`);
     }
@@ -190,6 +204,30 @@ function validateMovie(movie, expected, trusted = false) {
         return false;
     }
     return true;
+}
+
+/**
+ * @description True if a movie title starts with the parsed words (filler words ignored) and has
+ *              no extra sequel marker. Names under 4 letters never match.
+ * @param {Object} movie - Movie object from Radarr
+ * @param {Object} expected - Result of getExpectedInfo
+ * @returns {bool} true if one of the titles starts with the words
+ */
+function wordsMatch(movie, expected) {
+    const filler = ['the', 'a', 'an', 'movie', 'film'];
+    const sequel = /^(ii|iii|iv|v|vi|vii|viii|ix|x|[0-9]|part|chapter)$/;
+    const words = t => (t || '').toLowerCase().replace(/&/g, 'and')
+        .split(/[^a-z0-9\u0590-\u05ff]+/).filter(w => w && !filler.includes(w));
+    const titles = [movie.title, movie.originalTitle, ...(movie.alternateTitles || []).map(a => a.title)]
+        .filter(t => t).map(words);
+
+    return expected.titles.some(t => {
+        const wanted = words(t);
+        if (wanted.join('').length < 4) return false;
+        return titles.some(have =>
+            wanted.every((w, i) => have[i] === w) &&
+            !have.some(w => !wanted.includes(w) && sequel.test(w)));
+    });
 }
 
 /**
@@ -333,7 +371,8 @@ function searchInQueue(searchPattern, radarr, isValid) {
     Logger.ILog(`Searching in Queue`);
 
     return searchRadarrAPI('queue', searchPattern, radarr, (item, sp) => {
-        return item.outputPath?.toLowerCase().includes(sp);
+        const loose = n => (n || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+        return loose(item.title) === loose(sp) || baseName(item.outputPath) === sp;
     }, item => isValid(item.movie, true));   // queue items are Radarr's own grabs
 }
 
@@ -365,8 +404,7 @@ function searchInDownloadHistory(searchPattern, radarr, isValid) {
 function searchInGrabHistory(searchPattern, radarr, isValid) {
     Logger.ILog(`Searching in Grab History`);
 
-    // Indexers often report release names with spaces instead of dots, so compare
-    // both sides with punctuation collapsed
+    // Compare with punctuation collapsed (dots vs spaces)
     const loose = s => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
     return searchRadarrAPI('history', searchPattern, radarr, (item, sp) => {
         return item.sourceTitle && loose(item.sourceTitle) === loose(sp);
@@ -374,9 +412,7 @@ function searchInGrabHistory(searchPattern, radarr, isValid) {
 }
 
 /**
- * @description Generic function to search Radarr API (queue or history) based on a search pattern.
- *              Every record that matches the pattern is checked with acceptItem, so a record that
- *              Radarr attached to the wrong movie is skipped instead of returned.
+ * @description Searches the queue or history; a matching record is returned only if acceptItem passes
  * @param {string} endpoint - The Radarr API endpoint to search (queue or history)
  * @param {string} searchPattern - The search string (file or folder name)
  * @param {Object} radarr - Radarr API instance

@@ -50,7 +50,9 @@ function Script(URL, ApiKey, ImportPath, UseUnmappedPath, MoveMode, TimeOut) {
 
     /*─ Find the download in Sonarr's queue, so the import is tied to it ─*/
     const downloadId = Variables['Sonarr.downloadId'] ||
-                       (seriesId && episodeIds.length ? findDownloadId(sonarr, seriesId, episodeIds) : null);
+                       (seriesId && episodeIds.length
+                           ? findDownloadId(sonarr, seriesId, episodeIds, [Variables.file.Orig.FileNameNoExtension, Variables.folder?.Orig?.Name].filter(n => n))
+                           : null);
 
     /*─ Execute first workflow, then fail-over if needed ─*/
     if (seriesId && episodeIds.length) {
@@ -110,7 +112,7 @@ function manualImportWorkflow(sonarr, path, mode, seriesId, episodeIds, download
     const status = waitForCommand(sonarr, cmdId, timeout);
     if (status !== 1) return status;
 
-    // A completed command doesn't mean the file was imported: check the episodes got a new file
+    // Verify the episodes got a new file
     const after = getEpisodeFileIds(sonarr, episodeIds);
     if (after === null || before === null) return 1; // could not verify
     const missing = episodeIds.filter(id => !after[id] || after[id] === before[id]);
@@ -169,8 +171,7 @@ function pickCandidate(candidates, path, belongs) {
     const ours = withQuality.filter(c => belongs(c) && !isSample(c));
     const real = withQuality.filter(c => !isSample(c));
 
-    // Prefer the file by name, then the only non-sample file Sonarr matched to our item,
-    // then the only non-sample file
+    // By name, then the only non-sample file matched to our item, then the only non-sample file
     const cand = byName[0] ||
                  (ours.length === 1 ? ours[0] : null) ||
                  (real.length === 1 ? real[0] : null);
@@ -183,6 +184,15 @@ function pickCandidate(candidates, path, belongs) {
     }
     Logger.ILog(`Using ManualImport candidate: ${cand.path}`);
     return cand;
+}
+
+/**
+ * @description Compares release names ignoring case and punctuation (dots vs spaces)
+ * @param {string} s - Release name
+ * @returns {string} Collapsed name
+ */
+function loose(s) {
+    return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
 /**
@@ -224,20 +234,31 @@ function buildManualImportFile(src, seriesId, episodeIds, importPath, downloadId
 }
 
 /**
- * @description Finds the download client id of the queue item holding these episodes
+ * @description Finds the queue downloadId for these episodes whose release name matches the file or folder
  * @param {Sonarr}   sonarr - Sonarr API instance
  * @param {number}   seriesId - Series id
  * @param {number[]} episodeIds - Episode ids
+ * @param {string[]} names - File name without extension and folder name
  * @returns {string|null} downloadId, or null if the download is not in the queue
  */
-function findDownloadId(sonarr, seriesId, episodeIds) {
+function findDownloadId(sonarr, seriesId, episodeIds, names) {
+    const wanted = names.map(loose);
     try {
         const json = sonarr.fetchJson('queue', buildQueryParams({ page: 1, pageSize: 1000, includeUnknownSeriesItems: 'false' }));
-        const item = (json?.records || []).find(r =>
+        const forEpisodes = (json?.records || []).filter(r =>
             r.seriesId === seriesId && episodeIds.includes(r.episodeId) && r.downloadId);
-        if (item) {
-            Logger.ILog(`Found the download in Sonarr's queue: ${item.title} (downloadId ${item.downloadId})`);
-            return item.downloadId;
+        const ids = [...new Set(forEpisodes
+            .filter(r => wanted.includes(loose(r.title)) || wanted.includes(loose(baseName(r.outputPath))))
+            .map(r => r.downloadId))];
+        if (ids.length === 1) {
+            const item = forEpisodes.find(r => r.downloadId === ids[0]);
+            Logger.ILog(`Found the download in Sonarr's queue: ${item.title} (downloadId ${ids[0]})`);
+            return ids[0];
+        }
+        if (ids.length > 1) {
+            Logger.WLog(`${ids.length} downloads for this file are in the queue, not linking the import to one`);
+        } else if (forEpisodes.length) {
+            Logger.ILog(`Queue has download(s) for these episodes, but none is this release: ${[...new Set(forEpisodes.map(r => r.title))].join(', ')}`);
         }
     } catch (e) {
         Logger.WLog(`Could not read Sonarr's queue: ${e.message}`);
