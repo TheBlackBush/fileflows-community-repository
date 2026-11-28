@@ -32,6 +32,9 @@ function Script(URL, ApiKey) {
 
     // Try the file name first, then fall back to the folder name
     let movie = lookupMovie(fileNameNoExt, radarr, false);
+    if (!movie && stripGroupPrefix(fileNameNoExt)) {
+        movie = lookupMovie(stripGroupPrefix(fileNameNoExt), radarr, false);
+    }
     if (!movie && folderName && folderName.toLowerCase() !== (fileNameNoExt || '').toLowerCase()) {
         Logger.ILog('No match using the file name, trying the folder name');
         movie = lookupMovie(folderName, radarr, true);
@@ -44,6 +47,16 @@ function Script(URL, ApiKey) {
 
     updateMovieMetadata(movie);
     return 1; // Movie found
+}
+
+/**
+ * @description Removes a leading release group from a file name ("grp-title.2020" to "title.2020")
+ * @param {string} name - File name
+ * @returns {string|null} The name without the prefix, or null if it has none
+ */
+function stripGroupPrefix(name) {
+    const stripped = (name || '').replace(/^[a-z0-9]{2,12}-(?=[a-z])/, '');
+    return stripped !== name ? stripped : null;
 }
 
 /**

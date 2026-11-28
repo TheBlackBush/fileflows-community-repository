@@ -11,7 +11,7 @@ import { Sonarr } from 'Shared/Sonarr';
  * - After the import, checks that the episodes really got the new file.
  * - Falls back to a downloadedEpisodesScan when no series/episodes are known or the Manual Import can't be started.
  * @author iBuSH
- * @revision 8
+ * @revision 9
  * @version 2.0.0
  * @param {string} URL Sonarr root URL and port (e.g. http://sonarr:8989).
  * @param {string} ApiKey Sonarr API Key.
@@ -42,10 +42,16 @@ function Script(URL, ApiKey, ImportPath, UseUnmappedPath, MoveMode, TimeOut) {
 
     if (!seriesId || !episodeIds.length) {
         Logger.ILog('No seriesId/episodeIds from the lookup step, trying to parse the file/folder name');
-        const parsed = parseSeries(Variables.file.Orig.FileNameNoExtension, sonarr) ||
-                       parseSeries(Variables.folder?.Orig?.Name, sonarr);
-        seriesId = parsed?.series?.id ?? null;
-        episodeIds = toIdList(parsed?.episodes);
+        const fileName = Variables.file.Orig.FileNameNoExtension;
+        let parsed = parseSeries(fileName, sonarr) || parseSeries(stripGroupPrefix(fileName), sonarr);
+        let episodes = parsed?.episodes || [];
+        if (!parsed) {
+            // A folder parse (season pack) returns every episode: keep only the file's episodes
+            parsed = parseSeries(Variables.folder?.Orig?.Name, sonarr);
+            episodes = filterByFileName(parsed?.episodes || [], fileName);
+        }
+        seriesId = episodes.length ? parsed.series.id : null;
+        episodeIds = toIdList(episodes);
     }
 
     /*─ Find the download in Sonarr's queue, so the import is tied to it ─*/
@@ -64,7 +70,38 @@ function Script(URL, ApiKey, ImportPath, UseUnmappedPath, MoveMode, TimeOut) {
         Logger.ILog('No seriesId/episodeIds → downloadedEpisodesScan');
     }
 
-    return scanWorkflow(sonarr, ImportPath, importMode, downloadId, TimeOut);
+    return scanWorkflow(sonarr, ImportPath, importMode, downloadId, TimeOut, episodeIds);
+}
+
+/**
+ * @description Removes a leading release group from a file name ("grp-show.s01e01" to "show.s01e01")
+ * @param {string} name - File name
+ * @returns {string|null} The name without the prefix, or null if it has none
+ */
+function stripGroupPrefix(name) {
+    const stripped = (name || '').replace(/^[a-z0-9]{2,12}-(?=[a-z])/, '');
+    return stripped !== name ? stripped : null;
+}
+
+/**
+ * @description Keeps the episodes whose SxxEyy is in the file name
+ * @param {Object[]} episodes - Episodes from a folder parse
+ * @param {string} fileName - File name without extension
+ * @returns {Object[]} Matching episodes (empty if the file name has no SxxEyy or none match)
+ */
+function filterByFileName(episodes, fileName) {
+    const m = /s(\d{1,2})((?:[ ._-]?e\d{1,3})+)/i.exec(fileName || '');
+    if (!m) {
+        if (episodes.length) Logger.WLog('File name has no SxxEyy, not importing it as the whole season');
+        return [];
+    }
+    const season = Number(m[1]);
+    const numbers = (m[2].match(/\d{1,3}/g) || []).map(Number);
+    const matched = episodes.filter(e => e.seasonNumber === season && numbers.includes(e.episodeNumber));
+    Logger.ILog(matched.length
+        ? `Episodes for this file: [${matched.map(e => `S${e.seasonNumber}E${e.episodeNumber}`).join(', ')}]`
+        : `None of the parsed episodes is S${season}E${numbers.join('E')}`);
+    return matched;
 }
 
 /**
@@ -134,7 +171,8 @@ function manualImportWorkflow(sonarr, path, mode, seriesId, episodeIds, download
  */
 function getManualImportCandidates(sonarr, importPath, seriesId, downloadId) {
     try {
-        const params = { folder: importPath, seriesId: seriesId, filterExistingFiles: 'false' };
+        // No seriesId here: with it Sonarr lists the series' library files instead of the folder
+        const params = { folder: importPath, filterExistingFiles: 'false' };
         if (downloadId) params.downloadId = downloadId;
         const resp = sonarr.fetchJson('manualimport', buildQueryParams(params)) || [];
         Logger.ILog(`ManualImport returned ${resp.length} candidate(s).`);
@@ -295,16 +333,30 @@ function getEpisodeFileIds(sonarr, episodeIds) {
  * @param {string} mode – 'move' or 'copy'
  * @param {string} downloadId - Download client id of the grab, or null
  * @param {number} timeout – Timeout in milliseconds
+ * @param {number[]} episodeIds - Episodes to verify after the scan, or empty
  * @returns {number} 1 on success, −1 on failure
  */
-function scanWorkflow(sonarr, importPath, mode, downloadId, timeout) {
+function scanWorkflow(sonarr, importPath, mode, downloadId, timeout, episodeIds) {
     const body = { path: importPath, importMode: mode };
     if (downloadId) body.downloadClientId = downloadId;
 
+    const before = episodeIds?.length ? getEpisodeFileIds(sonarr, episodeIds) : null;
     const cmdId = sendCommand(sonarr, 'downloadedEpisodesScan', body);
     if (cmdId === null) return -1;
 
-    return waitForCommand(sonarr, cmdId, timeout);
+    const status = waitForCommand(sonarr, cmdId, timeout);
+    if (status !== 1 || !before) return status;
+
+    // A scan completes even when it imports nothing, so check the episodes
+    const after = getEpisodeFileIds(sonarr, episodeIds);
+    if (after === null) return 1; // could not verify
+    const missing = episodeIds.filter(id => !after[id] || after[id] === before[id]);
+    if (missing.length) {
+        Logger.WLog(`downloadedEpisodesScan finished but episodes [${missing.join(', ')}] did not get a new file. Check Sonarr's logs.`);
+        return -1;
+    }
+    Logger.ILog('Import verified: every episode has the new file');
+    return 1;
 }
 
 /*────────────────────────────── helpers ──────────────────────────────────*/
@@ -345,6 +397,10 @@ function waitForCommand(sonarr, cmdId, timeoutMs) {
     const status = cmd?.status || (ok ? 'completed' : 'unknown');
     const message = cmd?.message ? ` - ${cmd.message}` : '';
 
+    if (ok && status === 'completed' && /fail/i.test(cmd?.message || '')) {
+        Logger.WLog(`Command ${cmdId} completed${message}`);
+        return -1;
+    }
     if (ok && status === 'completed') {
         Logger.ILog(`Command ${cmdId} completed${message}`);
         return 1;

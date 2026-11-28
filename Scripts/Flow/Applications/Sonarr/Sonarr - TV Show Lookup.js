@@ -32,6 +32,9 @@ function Script(URL, ApiKey) {
 
     // Try the file name first, then the folder name
     let series = lookupSeries(fileNameNoExt, sonarr, false);
+    if (!series && stripGroupPrefix(fileNameNoExt)) {
+        series = lookupSeries(stripGroupPrefix(fileNameNoExt), sonarr, false);
+    }
     if (!series && folderName && folderName.toLowerCase() !== (fileNameNoExt || '').toLowerCase()) {
         Logger.ILog('No match using the file name, trying the folder name');
         series = lookupSeries(folderName, sonarr, true);
@@ -223,7 +226,9 @@ function titleMatches(series, expected) {
  * @param {Object} sonarr - Sonarr API instance
  */
 function refineEpisodes(series, fileNameNoExt, sonarr) {
-    const parsed = parseSeries(fileNameNoExt, sonarr, true);
+    let parsed = parseSeries(fileNameNoExt, sonarr, true);
+    const stripped = stripGroupPrefix(fileNameNoExt);
+    if (!parsed?.parsedEpisodeInfo && stripped) parsed = parseSeries(stripped, sonarr, true);
     const info = parsed?.parsedEpisodeInfo;
 
     // Sonarr mapped the file to this series and knows the episodes: use them as-is
@@ -233,10 +238,11 @@ function refineEpisodes(series, fileNameNoExt, sonarr) {
         return;
     }
 
-    const filter = getEpisodeFilter(info);
+    const filter = getEpisodeFilter(info) || getFileNameFilter(fileNameNoExt);
     if (!filter) {
         if ((series.EpisodesInfo?.length || 0) > 1) {
-            Logger.WLog(`Could not parse episode numbers from the file name, keeping ${series.EpisodesInfo.length} episodes`);
+            Logger.WLog(`Could not find episode numbers in the file name, not assigning ${series.EpisodesInfo.length} episodes to one file`);
+            series.EpisodesInfo = [];
         }
         return;
     }
@@ -293,6 +299,33 @@ function getEpisodeFilter(info) {
         };
     }
     return null;
+}
+
+/**
+ * @description Builds an episode filter from an SxxEyy in the file name, when Sonarr can't parse it
+ * @param {string} fileName - File name without extension
+ * @returns {Object|null} { test: Function, count: number, label: string } or null
+ */
+function getFileNameFilter(fileName) {
+    const m = /s(\d{1,2})((?:[ ._-]?e\d{1,3})+)/i.exec(fileName || '');
+    if (!m) return null;
+    const season = Number(m[1]);
+    const eps = (m[2].match(/\d{1,3}/g) || []).map(Number);
+    return {
+        test: ep => ep.seasonNumber === season && eps.includes(ep.episodeNumber),
+        count: eps.length,
+        label: `S${season}E${eps.join('E')}`
+    };
+}
+
+/**
+ * @description Removes a leading release group from a file name ("grp-show.s01e01" to "show.s01e01")
+ * @param {string} name - File name
+ * @returns {string|null} The name without the prefix, or null if it has none
+ */
+function stripGroupPrefix(name) {
+    const stripped = (name || '').replace(/^[a-z0-9]{2,12}-(?=[a-z])/, '');
+    return stripped !== name ? stripped : null;
 }
 
 /**

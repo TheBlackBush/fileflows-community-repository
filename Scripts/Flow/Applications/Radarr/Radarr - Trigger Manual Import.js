@@ -11,7 +11,7 @@ import { Radarr } from 'Shared/Radarr';
  * - After the import, checks that the movie really got the new file.
  * - Falls back to a downloadedMoviesScan when no movie is known or the Manual Import can't be started.
  * @author iBuSH
- * @revision 9
+ * @revision 10
  * @version 2.0.0
  * @param {string} URL Radarr root URL and port (e.g. http://radarr:7878).
  * @param {string} ApiKey Radarr API Key.
@@ -42,6 +42,7 @@ function Script(URL, ApiKey, ImportPath, UseUnmappedPath, MoveMode, TimeOut) {
     if (!movieId) {
         Logger.ILog('No usable movieId from the lookup step, trying to parse the file/folder name');
         movieId = parseMovie(Variables.file.Orig.FileNameNoExtension, radarr) ||
+                  parseMovie(stripGroupPrefix(Variables.file.Orig.FileNameNoExtension), radarr) ||
                   parseMovie(Variables.folder?.Orig?.Name, radarr);
     }
 
@@ -58,7 +59,17 @@ function Script(URL, ApiKey, ImportPath, UseUnmappedPath, MoveMode, TimeOut) {
         Logger.ILog('No movieId → downloadedMoviesScan');
     }
 
-    return scanWorkflow(radarr, ImportPath, importMode, downloadId, TimeOut);
+    return scanWorkflow(radarr, ImportPath, importMode, downloadId, TimeOut, movieId);
+}
+
+/**
+ * @description Removes a leading release group from a file name ("grp-title.2020" to "title.2020")
+ * @param {string} name - File name
+ * @returns {string|null} The name without the prefix, or null if it has none
+ */
+function stripGroupPrefix(name) {
+    const stripped = (name || '').replace(/^[a-z0-9]{2,12}-(?=[a-z])/, '');
+    return stripped !== name ? stripped : null;
 }
 
 /**
@@ -122,7 +133,8 @@ function manualImportWorkflow(radarr, path, mode, movieId, downloadId, timeout) 
  */
 function getManualImportCandidates(radarr, importPath, movieId, downloadId) {
     try {
-        const params = { folder: importPath, movieId: movieId, filterExistingFiles: 'false' };
+        // No movieId here: with it Radarr lists the movie's library files instead of the folder
+        const params = { folder: importPath, filterExistingFiles: 'false' };
         if (downloadId) params.downloadId = downloadId;
         const resp = radarr.fetchJson('manualimport', buildQueryParams(params)) || [];
         Logger.ILog(`ManualImport returned ${resp.length} candidate(s).`);
@@ -301,16 +313,29 @@ function getMovieFileId(radarr, movieId) {
  * @param {string} mode – 'move' or 'copy'
  * @param {string} downloadId - Download client id of the grab, or null
  * @param {number} timeout – Timeout in milliseconds
+ * @param {number} movieId - Movie to verify after the scan, or null
  * @returns {number} 1 on success, −1 on failure
  */
-function scanWorkflow(radarr, importPath, mode, downloadId, timeout) {
+function scanWorkflow(radarr, importPath, mode, downloadId, timeout, movieId) {
     const body = { path: importPath, importMode: mode };
     if (downloadId) body.downloadClientId = downloadId;
 
+    const before = movieId ? getMovieFileId(radarr, movieId) : null;
     const cmdId = sendCommand(radarr, 'downloadedMoviesScan', body);
     if (cmdId === null) return -1;
 
-    return waitForCommand(radarr, cmdId, timeout);
+    const status = waitForCommand(radarr, cmdId, timeout);
+    if (status !== 1 || before === null) return status;
+
+    // A scan completes even when it imports nothing, so check the movie
+    const after = getMovieFileId(radarr, movieId);
+    if (after === null) return 1; // could not verify
+    if (!after || after === before) {
+        Logger.WLog(`downloadedMoviesScan finished but movie ${movieId} did not get a new file. Check Radarr's logs.`);
+        return -1;
+    }
+    Logger.ILog('Import verified: the movie has the new file');
+    return 1;
 }
 
 /*────────────────────────────── helpers ──────────────────────────────────*/
@@ -351,6 +376,10 @@ function waitForCommand(radarr, cmdId, timeoutMs) {
     const status = cmd?.status || (ok ? 'completed' : 'unknown');
     const message = cmd?.message ? ` - ${cmd.message}` : '';
 
+    if (ok && status === 'completed' && /fail/i.test(cmd?.message || '')) {
+        Logger.WLog(`Command ${cmdId} completed${message}`);
+        return -1;
+    }
     if (ok && status === 'completed') {
         Logger.ILog(`Command ${cmdId} completed${message}`);
         return 1;
